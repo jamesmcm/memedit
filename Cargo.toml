@@ -1,0 +1,14 @@
+[package]
+name = "memedit"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Consider disabling default features - chrono
+procfs = "0.15.1"
+
+# Bin only:
+anyhow = "1.0.71"
+cursive = "0.20.0"
