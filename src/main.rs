@@ -1,38 +1,90 @@
+mod ui;
+
+use std::io::{Read, Seek, SeekFrom};
 use std::{sync::mpsc::Receiver, sync::mpsc::Sender};
 
 use anyhow::{anyhow, Result};
-use cursive::{
-    align::HAlign,
-    event::EventResult,
-    theme::BaseColor,
-    traits::{Nameable as _, Resizable as _},
-    utils::markup::StyledString,
-    view::{Scrollable, View as _},
-    views::{Dialog, FixedLayout, Layer, OnEventView, OnLayoutView, SelectView, TextView},
-    Cursive, CursiveRunnable, {Rect, Vec2},
-};
-use memedit::*;
-use procfs::process::MMapPath;
-use procfs::process::Process;
+
+use memedit::ProcessRef;
+use procfs::process::{MMapPath, MemoryMaps};
+use procfs::process::{MemoryMap, Process};
 
 const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 pub struct State {
     pid: Option<i32>,
     step: Step,
-    sndToUi: Sender<RenderEvent>,
-    rcvFromUi: Receiver<UiEvent>,
+    snd_to_ui: Sender<RenderEvent>,
+    rcv_from_ui: Receiver<UiEvent>,
+    process: Option<Process>,
+    memory_map: Option<MemoryMap>,
     // mapname, range, memdump, addresses of interest
 }
 impl State {
+    // TODO: Separate these steps in actual state machine
     pub fn run(&mut self, initial_processes: &[ProcessRef]) -> Result<()> {
-        self.pid = match self.rcvFromUi.recv()? {
+        self.pid = match self.rcv_from_ui.recv()? {
             UiEvent::Select(index) => Some(initial_processes[index].pid),
             _ => {
                 anyhow::bail!("Failed to set PID");
             }
         };
+        eprintln!("PID: {}", self.pid.unwrap());
 
-        eprintln!("{}", self.pid.unwrap());
+        // TODO: Make heap default somehow
+        self.step = Step::GetMmap;
+        let process = Process::new(self.pid.unwrap())?;
+        let maps = process.maps()?;
+        self.process = Some(process);
+        self.snd_to_ui
+            .send(RenderEvent::GetMMap(maps.memory_maps.clone()))?; // TODO: Avoid clone
+
+        self.memory_map = match self.rcv_from_ui.recv()? {
+            UiEvent::Select(index) => Some(maps.memory_maps[index].clone()), // TODO: Avoid clone
+            _ => {
+                anyhow::bail!("Failed to set memory map");
+            }
+        };
+        eprintln!("memory map: {:?}", self.memory_map.as_ref().unwrap());
+
+        self.step = Step::LoadMem;
+        // TODO: Zero copy version - re-seeking, or can we read slice directly with process_vm_readv ?
+        let mut mem = self.process.as_ref().unwrap().mem().unwrap();
+        mem.seek(SeekFrom::Start(self.memory_map.as_ref().unwrap().address.0))
+            .unwrap();
+        let mut buf = vec![
+            0;
+            (self.memory_map.as_ref().unwrap().address.1
+                - self.memory_map.as_ref().unwrap().address.0) as usize
+        ];
+        mem.read_exact(&mut buf).unwrap();
+        // eprintln!(
+        //     "mem: {:?}",
+        //     buf.iter().map(|b| *b as char).collect::<Vec<char>>()
+        // );
+
+        self.snd_to_ui.send(RenderEvent::MainScreen(
+            self.memory_map.as_ref().unwrap().address.0,
+            self.memory_map.as_ref().unwrap().address.1,
+            buf.clone(),
+        ))?; // TODO: Pass reference
+
+        loop {
+            let event = self.rcv_from_ui.recv()?;
+
+            match event {
+                UiEvent::Quit => {
+                    // std::process::exit(0);
+                    break;
+                } // Enough to break here?
+                UiEvent::Search(search_string) => {
+                    // Handle search
+                    eprintln!("search string: {}", &search_string);
+
+                    self.snd_to_ui.send(RenderEvent::Dummy)?;
+                }
+                _ => eprintln!("Received unexpected UI event: {:?}", &event),
+            }
+        }
 
         Ok(())
     }
@@ -42,108 +94,26 @@ pub enum Step {
     GetPid,
     GetMmap,
     LoadMem,
-    SearchMem, // Add search parameters - predicate (changed, unchanged, equal, <, >), data type (int, float, string)
-    WriteMem,  // Add write parameters - address, length, infer data type, endianness?
+    WaitLoop,
+    SearchMem, // Add search parameters - domain, predicate (changed, unchanged, equal, <, >), data type (int, float, string)
+    WriteMem,  // Add write parameters - address, length, infer data type, endianness?, mass write?
 }
 
+#[derive(Debug)]
 pub enum UiEvent {
     Select(usize),
+    Search(String), // TODO: Handle other types - string, float, pointers
+    Quit,
 }
+
+// TODO: Avoid cloning via Arc Mutex etc.
 pub enum RenderEvent {
-    MainScreen,
+    GetPid(Vec<ProcessRef>),
+    GetMMap(Vec<MemoryMap>),
+    MainScreen(u64, u64, Vec<u8>),
+    Dummy,
 }
 
-pub struct Ui {
-    ui: CursiveRunnable,
-}
-
-impl Ui {
-    pub fn initiate_ui(&mut self) {
-        self.ui.add_global_callback('q', Cursive::quit);
-
-        self.ui.screen_mut().add_transparent_layer(
-            OnLayoutView::new(
-                FixedLayout::new().child(
-                    Rect::from_point(Vec2::zero()),
-                    Layer::new(
-                        TextView::new(format!(
-                            "memedit{}",
-                            VERSION
-                                .map(|vers| " v".to_string() + vers)
-                                .unwrap_or(String::new())
-                        ))
-                        .with_name("status"),
-                    )
-                    .full_width(),
-                ),
-                |layout, size| {
-                    layout.set_child_position(0, Rect::from_size((0, 0), (size.x, 1)));
-                    layout.layout(size);
-                },
-            )
-            .full_screen(),
-        );
-    }
-
-    pub fn select_pid(&mut self, processes: &[ProcessRef]) {
-        let mut select = SelectView::new().h_align(HAlign::Left);
-        let parsed_processes = processes
-            .into_iter()
-            .enumerate()
-            .filter(|(i, p)| !(p.command.is_empty() || p.exe.is_empty()))
-            .map(|(i, p)| {
-                (
-                    format!("{}    {}", p.pid, &p.exe[0..32.min(p.exe.len())]),
-                    i,
-                )
-            });
-
-        select.add_all(parsed_processes);
-
-        // Sets the callback for when "Enter" is pressed.
-        select.set_on_submit(|cursive: &mut Cursive, index: &usize| {
-            cursive.pop_layer();
-            let (snd, rcv): (Sender<UiEvent>, Receiver<RenderEvent>) =
-                cursive.take_user_data().unwrap();
-            snd.send(UiEvent::Select(*index)).unwrap();
-        });
-
-        // Let's override the `j` and `k` keys for navigation
-        let select = OnEventView::new(select)
-            .on_pre_event_inner('k', |s, _| {
-                let cb = s.select_up(1);
-                Some(EventResult::Consumed(Some(cb)))
-            })
-            .on_pre_event_inner('g', |s, _| {
-                let cb = s.select_up(s.len());
-                Some(EventResult::Consumed(Some(cb)))
-            })
-            .on_pre_event_inner('G', |s, _| {
-                let cb = s.select_down(s.len());
-                Some(EventResult::Consumed(Some(cb)))
-            })
-            .on_pre_event_inner('j', |s, _| {
-                let cb = s.select_down(1);
-                Some(EventResult::Consumed(Some(cb)))
-            })
-            .on_pre_event_inner('d', |s, _| {
-                let cb = s.select_down(10);
-                Some(EventResult::Consumed(Some(cb)))
-            })
-            .on_pre_event_inner('u', |s, _| {
-                let cb = s.select_up(10);
-                Some(EventResult::Consumed(Some(cb)))
-            });
-        self.ui.add_layer(
-            Dialog::around(select.scrollable().min_size((40, 10)))
-                .title("Select process to inspect:"),
-        );
-    }
-
-    pub fn run(&mut self) {
-        self.ui.run();
-    }
-}
 // TODO: Set pid with args
 // TODO: Sorting, searching, filtering on UID, fuzzy search, marquee for long commands, etc.
 // TODO: TUI menu
@@ -153,20 +123,23 @@ fn main() -> Result<()> {
     let (sndToMain, rcvFromUi) = std::sync::mpsc::channel::<UiEvent>();
 
     // Set UI channels as user data so they are accessible in callbacks
+    // TODO: Make this a struct for adding more UI state
     siv.set_user_data((sndToMain, rcvFromMain));
-    let mut ui = Ui { ui: siv };
+    let mut ui = ui::Ui { ui: siv };
     let mut state = State {
         pid: None,
         step: Step::GetPid,
-        sndToUi,
-        rcvFromUi,
+        snd_to_ui: sndToUi,
+        rcv_from_ui: rcvFromUi,
+        process: None,
+        memory_map: None,
     };
 
-    ui.initiate_ui();
-    let processes = get_running_pids()?;
+    ui.initiate_ui(VERSION);
+    let processes = memedit::get_running_pids()?;
 
     // Need to have something responsive on UI for first callback - start with PID selection
-    ui.select_pid(&processes);
+    ui::select_pid(&mut ui.ui, &processes);
 
     std::thread::spawn(move || state.run(&processes));
     ui.run();
@@ -178,8 +151,6 @@ fn main() -> Result<()> {
     // std::io::stdin().read_line(&mut pid_string)?;
 
     // let pid = pid_string.parse()?;
-    // let process = Process::new(pid)?;
-    // let maps = process.maps()?;
     // let heapmap = maps
     //     .into_iter()
     //     .find(|map| map.pathname == MMapPath::Heap)
