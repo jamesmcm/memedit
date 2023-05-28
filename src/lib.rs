@@ -3,6 +3,7 @@ use procfs::ProcResult;
 pub struct ProcessRef {
     pub pid: i32,
     pub command: String,
+    pub exe: String,
 }
 
 /// Get all running PIDs and their command strings
@@ -16,6 +17,11 @@ pub fn get_running_pids() -> ProcResult<Vec<ProcessRef>> {
                     p.cmdline().map(|cmd| ProcessRef {
                         pid: p.pid,
                         command: cmd.join(" "),
+                        exe: p
+                            .exe()
+                            .ok()
+                            .map(|x| x.to_string_lossy().to_string())
+                            .unwrap_or(String::new()),
                     })
                 })
                 .ok()

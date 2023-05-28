@@ -1,3 +1,5 @@
+use std::{sync::mpsc::Receiver, sync::mpsc::Sender};
+
 use anyhow::{anyhow, Result};
 use cursive::{
     align::HAlign,
@@ -16,26 +18,46 @@ use procfs::process::Process;
 const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 pub struct State {
     pid: Option<i32>,
+    step: Step,
+    sndToUi: Sender<RenderEvent>,
+    rcvFromUi: Receiver<UiEvent>,
     // mapname, range, memdump, addresses of interest
+}
+impl State {
+    pub fn run(&mut self, initial_processes: &[ProcessRef]) -> Result<()> {
+        self.pid = match self.rcvFromUi.recv()? {
+            UiEvent::Select(index) => Some(initial_processes[index].pid),
+            _ => {
+                anyhow::bail!("Failed to set PID");
+            }
+        };
+
+        eprintln!("{}", self.pid.unwrap());
+
+        Ok(())
+    }
 }
 
 pub enum Step {
     GetPid,
     GetMmap,
     LoadMem,
-    StartFilterMem,
-    EndFilterMem,
-    StartWriteMem,
-    EndWriteMem,
+    SearchMem, // Add search parameters - predicate (changed, unchanged, equal, <, >), data type (int, float, string)
+    WriteMem,  // Add write parameters - address, length, infer data type, endianness?
 }
 
-pub struct App {
+pub enum UiEvent {
+    Select(usize),
+}
+pub enum RenderEvent {
+    MainScreen,
+}
+
+pub struct Ui {
     ui: CursiveRunnable,
-    state: State,
-    step: Step,
 }
 
-impl App {
+impl Ui {
     pub fn initiate_ui(&mut self) {
         self.ui.add_global_callback('q', Cursive::quit);
 
@@ -63,60 +85,63 @@ impl App {
         );
     }
 
-    pub fn render_ui(&mut self) -> Result<()> {
-        match self.step {
-            Step::GetPid => {
-                let processes = get_running_pids()?;
-                let mut select = SelectView::new().h_align(HAlign::Left);
-                let strings = processes
-                    .into_iter()
-                    .filter(|p| !p.command.is_empty())
-                    .map(|p| format!("{}    {}", p.pid, &p.command[0..32.min(p.command.len())]))
-                    .collect::<Vec<String>>();
+    pub fn select_pid(&mut self, processes: &[ProcessRef]) {
+        let mut select = SelectView::new().h_align(HAlign::Left);
+        let parsed_processes = processes
+            .into_iter()
+            .enumerate()
+            .filter(|(i, p)| !(p.command.is_empty() || p.exe.is_empty()))
+            .map(|(i, p)| {
+                (
+                    format!("{}    {}", p.pid, &p.exe[0..32.min(p.exe.len())]),
+                    i,
+                )
+            });
 
-                select.add_all_str(&strings);
+        select.add_all(parsed_processes);
 
-                // Sets the callback for when "Enter" is pressed.
-                select.set_on_submit(|cursive, s: &str| {
-                    cursive.pop_layer();
-                    println!("{}", s);
-                });
+        // Sets the callback for when "Enter" is pressed.
+        select.set_on_submit(|cursive: &mut Cursive, index: &usize| {
+            cursive.pop_layer();
+            let (snd, rcv): (Sender<UiEvent>, Receiver<RenderEvent>) =
+                cursive.take_user_data().unwrap();
+            snd.send(UiEvent::Select(*index)).unwrap();
+        });
 
-                // Let's override the `j` and `k` keys for navigation
-                let select = OnEventView::new(select)
-                    .on_pre_event_inner('k', |s, _| {
-                        let cb = s.select_up(1);
-                        Some(EventResult::Consumed(Some(cb)))
-                    })
-                    .on_pre_event_inner('g', |s, _| {
-                        let cb = s.select_up(s.len());
-                        Some(EventResult::Consumed(Some(cb)))
-                    })
-                    .on_pre_event_inner('G', |s, _| {
-                        let cb = s.select_down(s.len());
-                        Some(EventResult::Consumed(Some(cb)))
-                    })
-                    .on_pre_event_inner('j', |s, _| {
-                        let cb = s.select_down(1);
-                        Some(EventResult::Consumed(Some(cb)))
-                    })
-                    .on_pre_event_inner('d', |s, _| {
-                        let cb = s.select_down(10);
-                        Some(EventResult::Consumed(Some(cb)))
-                    })
-                    .on_pre_event_inner('u', |s, _| {
-                        let cb = s.select_up(10);
-                        Some(EventResult::Consumed(Some(cb)))
-                    });
-                self.ui.add_layer(
-                    Dialog::around(select.scrollable().min_size((40, 10)))
-                        .title("Select process to inspect:"),
-                );
+        // Let's override the `j` and `k` keys for navigation
+        let select = OnEventView::new(select)
+            .on_pre_event_inner('k', |s, _| {
+                let cb = s.select_up(1);
+                Some(EventResult::Consumed(Some(cb)))
+            })
+            .on_pre_event_inner('g', |s, _| {
+                let cb = s.select_up(s.len());
+                Some(EventResult::Consumed(Some(cb)))
+            })
+            .on_pre_event_inner('G', |s, _| {
+                let cb = s.select_down(s.len());
+                Some(EventResult::Consumed(Some(cb)))
+            })
+            .on_pre_event_inner('j', |s, _| {
+                let cb = s.select_down(1);
+                Some(EventResult::Consumed(Some(cb)))
+            })
+            .on_pre_event_inner('d', |s, _| {
+                let cb = s.select_down(10);
+                Some(EventResult::Consumed(Some(cb)))
+            })
+            .on_pre_event_inner('u', |s, _| {
+                let cb = s.select_up(10);
+                Some(EventResult::Consumed(Some(cb)))
+            });
+        self.ui.add_layer(
+            Dialog::around(select.scrollable().min_size((40, 10)))
+                .title("Select process to inspect:"),
+        );
+    }
 
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+    pub fn run(&mut self) {
+        self.ui.run();
     }
 }
 // TODO: Set pid with args
@@ -124,17 +149,27 @@ impl App {
 // TODO: TUI menu
 fn main() -> Result<()> {
     let mut siv = cursive::default();
-    let mut state = State { pid: None };
-    let mut app = App {
-        ui: siv,
-        state,
+    let (sndToUi, rcvFromMain) = std::sync::mpsc::channel::<RenderEvent>();
+    let (sndToMain, rcvFromUi) = std::sync::mpsc::channel::<UiEvent>();
+
+    // Set UI channels as user data so they are accessible in callbacks
+    siv.set_user_data((sndToMain, rcvFromMain));
+    let mut ui = Ui { ui: siv };
+    let mut state = State {
+        pid: None,
         step: Step::GetPid,
+        sndToUi,
+        rcvFromUi,
     };
 
-    // TODO: Let UI callbacks communicate with state machine via channels
-    app.initiate_ui();
-    app.render_ui()?;
-    app.ui.run();
+    ui.initiate_ui();
+    let processes = get_running_pids()?;
+
+    // Need to have something responsive on UI for first callback - start with PID selection
+    ui.select_pid(&processes);
+
+    std::thread::spawn(move || state.run(&processes));
+    ui.run();
 
     // for p in processes {
     //     println!("{}\t{}", p.pid, p.command);
