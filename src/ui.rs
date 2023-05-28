@@ -1,21 +1,18 @@
 use cursive::{
     align::HAlign,
     event::EventResult,
-    theme::BaseColor,
     traits::{Nameable as _, Resizable as _},
-    utils::markup::StyledString,
     view::{Scrollable, View as _},
     views::{
-        Dialog, EditView, FixedLayout, Layer, LinearLayout, OnEventView, OnLayoutView, ResizedView,
-        SelectView, TextArea, TextView,
+        Dialog, EditView, FixedLayout, Layer, LinearLayout, OnEventView, OnLayoutView, SelectView,
+        TextArea, TextView,
     },
     Cursive, CursiveRunnable, {Rect, Vec2},
 };
 
 use crate::{RenderEvent, UiEvent}; // TODO: Move binary to other crate
 
-use procfs::process::{MMapPath, MemoryMaps};
-use procfs::process::{MemoryMap, Process};
+use procfs::process::MemoryMap;
 
 use memedit::ProcessRef;
 
@@ -63,9 +60,9 @@ impl Ui {
 pub fn select_pid(ui: &mut Cursive, processes: &[ProcessRef]) {
     let mut select = SelectView::new().h_align(HAlign::Left);
     let parsed_processes = processes
-        .into_iter()
+        .iter()
         .enumerate()
-        .filter(|(i, p)| !(p.command.is_empty() || p.exe.is_empty()))
+        .filter(|(_i, p)| !(p.command.is_empty() || p.exe.is_empty()))
         .map(|(i, p)| {
             (
                 format!("{}    {}", p.pid, &p.exe[0..32.min(p.exe.len())]),
@@ -120,7 +117,7 @@ pub fn load_main_screen(ui: &mut Cursive, mem: (u64, u64, &[u8])) {
     // let view = ResizedView::with_full_screen(text_area);
     let view = OnEventView::new(text_area)
         .on_pre_event('q', |c| c.quit())
-        .on_pre_event('/', |c| display_search_screen(c));
+        .on_pre_event('/', display_search_screen);
     ui.add_layer(view);
 }
 
@@ -168,7 +165,8 @@ pub fn common_list_settings(mut select: SelectView<usize>) -> OnEventView<Select
     });
 
     // Let's override the `j` and `k` keys for navigation
-    let select = OnEventView::new(select)
+
+    OnEventView::new(select)
         .on_pre_event_inner('k', |s, _| {
             let cb = s.select_up(1);
             Some(EventResult::Consumed(Some(cb)))
@@ -192,8 +190,7 @@ pub fn common_list_settings(mut select: SelectView<usize>) -> OnEventView<Select
         .on_pre_event_inner('u', |s, _| {
             let cb = s.select_up(10);
             Some(EventResult::Consumed(Some(cb)))
-        });
-    select
+        })
 }
 
 pub fn handle_render_event(cursive: &mut Cursive, render_event: RenderEvent) {

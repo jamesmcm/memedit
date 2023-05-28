@@ -3,10 +3,10 @@ mod ui;
 use std::io::{Read, Seek, SeekFrom};
 use std::{sync::mpsc::Receiver, sync::mpsc::Sender};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use memedit::ProcessRef;
-use procfs::process::{MMapPath, MemoryMaps};
+
 use procfs::process::{MemoryMap, Process};
 
 const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
@@ -119,18 +119,18 @@ pub enum RenderEvent {
 // TODO: TUI menu
 fn main() -> Result<()> {
     let mut siv = cursive::default();
-    let (sndToUi, rcvFromMain) = std::sync::mpsc::channel::<RenderEvent>();
-    let (sndToMain, rcvFromUi) = std::sync::mpsc::channel::<UiEvent>();
+    let (snd_to_ui, rcv_from_main) = std::sync::mpsc::channel::<RenderEvent>();
+    let (snd_to_main, rcv_from_ui) = std::sync::mpsc::channel::<UiEvent>();
 
     // Set UI channels as user data so they are accessible in callbacks
     // TODO: Make this a struct for adding more UI state
-    siv.set_user_data((sndToMain, rcvFromMain));
+    siv.set_user_data((snd_to_main, rcv_from_main));
     let mut ui = ui::Ui { ui: siv };
     let mut state = State {
         pid: None,
         step: Step::GetPid,
-        snd_to_ui: sndToUi,
-        rcv_from_ui: rcvFromUi,
+        snd_to_ui,
+        rcv_from_ui,
         process: None,
         memory_map: None,
     };
