@@ -2,6 +2,13 @@
 name = "memedit"
 version = "0.1.0"
 edition = "2021"
+description = "Memory editor library and TUI binary"
+authors = ["James McMurray <jamesmcm03@gmail.com>"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jamesmcm/memedit"
+homepage = "https://github.com/jamesmcm/memedit"
+readme = "README.md"
+keywords = ["memedit", "memory", "tsearch", "gameconqueror", "memscan"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
